@@ -15,42 +15,48 @@ async def chat_with_agent(agent, runner, user_message: str, session_id=None):
         text = await runner.chat(agent, user_message)
         return text, None
 
+    import asyncio
     from google.genai import types
 
     user_id = "student"
     app_name = runner.app_name
 
-    session = None
-    if session_id is not None:
+    for attempt in range(4):
         try:
-            session = await runner.session_service.get_session(
-                app_name=app_name, user_id=user_id, session_id=session_id
+            session = None
+            if session_id is not None:
+                try:
+                    session = await runner.session_service.get_session(
+                        app_name=app_name, user_id=user_id, session_id=session_id
+                    )
+                except (ValueError, KeyError):
+                    pass
+
+            if session is None:
+                session = await runner.session_service.create_session(
+                    app_name=app_name, user_id=user_id
+                )
+
+            content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=user_message)],
             )
-        except (ValueError, KeyError):
-            pass
 
-    if session is None:
-        try:
-            session = await runner.session_service.create_session(
-                app_name=app_name, user_id=user_id
-            )
-        except Exception:
-            session = await runner.session_service.create_session(
-                app_name=app_name, user_id=user_id
-            )
+            final_response = ""
+            async for event in runner.run_async(
+                user_id=user_id, session_id=session.id, new_message=content
+            ):
+                if hasattr(event, "content") and event.content and event.content.parts:
+                    for part in event.content.parts:
+                        if hasattr(part, "text") and part.text:
+                            final_response += part.text
 
-    content = types.Content(
-        role="user",
-        parts=[types.Part.from_text(text=user_message)],
-    )
-
-    final_response = ""
-    async for event in runner.run_async(
-        user_id=user_id, session_id=session.id, new_message=content
-    ):
-        if hasattr(event, "content") and event.content and event.content.parts:
-            for part in event.content.parts:
-                if hasattr(part, "text") and part.text:
-                    final_response += part.text
-
-    return final_response, session
+            return final_response, session
+        except Exception as e:
+            err_msg = str(e)
+            if any(k in err_msg for k in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED")) and attempt < 3:
+                wait_sec = 15 if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg) else 5
+                print(f"  [API Retry] Temporary server issue ({err_msg[:45]}...), waiting {wait_sec}s...")
+                await asyncio.sleep(wait_sec)
+            else:
+                raise
